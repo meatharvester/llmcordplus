@@ -16,7 +16,6 @@ from .constants import (
     STREAMING_INDICATOR,
     EDIT_DELAY_SECONDS,
     THINKING_SINCE_TEMPLATE,
-    DONE_THINKING_PREFIX,
     FOOTER_STREAMING_SUFFIX,
 )
 from .messages import MsgNode
@@ -50,8 +49,9 @@ async def stream_and_reply(
     start_perf = time.perf_counter()
     output_start_perf: float | None = None
     reasoning_started: bool = False
-    reasoning_start_perf: float | None = None
     reasoning_start_unix: int | None = None
+    reasoning_preview: str = ""
+    reasoning_accumulated: str = ""
 
     # Accumulated visible output
     response_full_text: str = ""
@@ -77,6 +77,49 @@ async def stream_and_reply(
         if len(text) <= limit:
             return text
         return text[:limit] + "… (truncated)"
+
+    def _extract_reasoning_text(source: Any | None) -> str:
+        """Return reasoning/thinking text from OpenAI-compatible delta/message objects."""
+
+        if not source:
+            return ""
+
+        for attr in ("reasoning", "reasoning_content", "thinking"):
+            value = getattr(source, attr, None)
+            if not value:
+                continue
+
+            if isinstance(value, str):
+                return value
+
+            if isinstance(value, (list, tuple)):
+                return "".join(str(part) for part in value if part)
+
+            if isinstance(value, dict):
+                text = value.get("text") or value.get("content") or value.get("delta")
+                if text:
+                    return str(text)
+                return str(value)
+
+            return str(value)
+
+        return ""
+
+    def _format_reasoning_preview(text: str) -> str:
+        if not text:
+            return ""
+        normalized = re.sub(r"\r\n?|\n", "\n", text)
+        lines = [re.sub(r"\s+", " ", line).strip() for line in normalized.split("\n")]
+        lines = [line for line in lines if line]
+        if not lines:
+            return ""
+        preview_lines: list[str] = []
+        for line in lines[-3:]:
+            truncated = line[-50:]
+            if len(line) > 50:
+                truncated = "..." + truncated
+            preview_lines.append(f"-# *{truncated}*")
+        return "\n".join(preview_lines)
 
     async def abort_and_send_error(error_text: str) -> None:
         """Delete any messages we created, release locks, and notify the user."""
@@ -159,17 +202,51 @@ async def stream_and_reply(
                 choice = event.choices[0]
                 # Extract raw content delta if present
                 raw_delta = getattr(getattr(choice, "delta", None), "content", "") or ""
+                reasoning_delta = _extract_reasoning_text(
+                    getattr(choice, "delta", None)
+                )
                 visible_delta = ""
 
-                if raw_delta:
-                    visible_delta, saw_thinking = think_redactor.process(raw_delta)
-                    if saw_thinking and not reasoning_started:
-                        reasoning_started = True
-                        reasoning_start_perf = time.perf_counter()
-                        reasoning_start_unix = int(time.time())
+                finish_reason = getattr(choice, "finish_reason", None)
+
+                extra_segments: list[str] = []
+                if reasoning_delta:
+                    reasoning_accumulated += reasoning_delta
+                    extra_segments.append(
+                        f"{ThinkBlockRedactor.OPEN_TAG}{reasoning_delta}{ThinkBlockRedactor.CLOSE_TAG}"
+                    )
+                    reasoning_preview = _format_reasoning_preview(reasoning_accumulated)
+
+                # Some providers (e.g., Ollama) attach full reasoning to the completed message.
+                if finish_reason is not None:
+                    message_reasoning = _extract_reasoning_text(
+                        getattr(choice, "message", None)
+                    )
+                    if message_reasoning:
+                        reasoning_accumulated += message_reasoning
+                        extra_segments.append(
+                            f"{ThinkBlockRedactor.OPEN_TAG}{message_reasoning}{ThinkBlockRedactor.CLOSE_TAG}"
+                        )
+                        reasoning_preview = _format_reasoning_preview(
+                            reasoning_accumulated
+                        )
+
+                composite_delta = "".join(extra_segments) + raw_delta
+
+                visible_delta = ""
+                saw_thinking = False
+
+                if composite_delta:
+                    visible_delta, saw_thinking = think_redactor.process(
+                        composite_delta
+                    )
+
+                if saw_thinking and not reasoning_started:
+                    reasoning_started = True
+                    reasoning_start_unix = int(time.time())
 
                 # On finish, flush any buffered think text even if no content in this chunk
-                if getattr(choice, "finish_reason", None) is not None:
+                if finish_reason is not None:
                     tail = think_redactor.flush()
                     if tail:
                         visible_delta += tail
@@ -181,7 +258,7 @@ async def stream_and_reply(
                 # Skip if no visible content and not finishing AND no thinking detected
                 if (
                     not visible_delta
-                    and getattr(choice, "finish_reason", None) is None
+                    and finish_reason is None
                     and not reasoning_started
                 ):
                     continue
@@ -230,24 +307,16 @@ async def stream_and_reply(
                     if ready_to_edit or is_final_edit:
                         # Build header for the first message only
                         header = ""
-                        if reasoning_started:
-                            if (
-                                output_start_perf is None
-                                and reasoning_start_unix is not None
-                            ):
-                                header = THINKING_SINCE_TEMPLATE.replace(
-                                    "{ts}", str(reasoning_start_unix)
-                                )
-                            elif (
-                                output_start_perf is not None
-                                and reasoning_start_perf is not None
-                            ):
-                                elapsed_head = output_start_perf - reasoning_start_perf
-                                mins, secs = divmod(int(elapsed_head), 60)
-                                time_str = f"{mins}m {secs}s"
-                                header = DONE_THINKING_PREFIX.replace(
-                                    "{time}", time_str
-                                )
+                        if (
+                            reasoning_started
+                            and output_start_perf is None
+                            and reasoning_start_unix is not None
+                        ):
+                            header = THINKING_SINCE_TEMPLATE.replace(
+                                "{ts}", str(reasoning_start_unix)
+                            )
+                            if reasoning_preview:
+                                header = header + "\n" + reasoning_preview
 
                         # Build full body including streaming indicator (only for the last segment)
                         body_now = response_full_text
@@ -404,16 +473,16 @@ async def stream_and_reply(
 
             # Build the final set of message descriptions (split across messages)
             header = ""
-            if reasoning_started:
-                if output_start_perf is None and reasoning_start_unix is not None:
-                    header = THINKING_SINCE_TEMPLATE.replace(
-                        "{ts}", str(reasoning_start_unix)
-                    )
-                elif output_start_perf is not None and reasoning_start_perf is not None:
-                    elapsed_head = output_start_perf - reasoning_start_perf
-                    mins, secs = divmod(int(elapsed_head), 60)
-                    time_str = f"{mins}m {secs}s"
-                    header = DONE_THINKING_PREFIX.replace("{time}", time_str)
+            if (
+                reasoning_started
+                and output_start_perf is None
+                and reasoning_start_unix is not None
+            ):
+                header = THINKING_SINCE_TEMPLATE.replace(
+                    "{ts}", str(reasoning_start_unix)
+                )
+                if reasoning_preview:
+                    header = header + "\n" + reasoning_preview
 
             remaining = response_full_text.lstrip("\n")
             final_descriptions: list[str] = []

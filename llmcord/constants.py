@@ -25,8 +25,8 @@ MAX_MESSAGE_NODES = 500
 FOOTER_REASONING_SUFFIX = " • thinking..."
 FOOTER_STREAMING_SUFFIX = " • streaming..."
 
-THINKING_SINCE_TEMPLATE = "💭 Thinking since <t:{ts}:R>..."
-DONE_THINKING_PREFIX = "💡 Done thinking! Took `{time}`."
+THINKING_SINCE_TEMPLATE = "**💭 Thinking since <t:{ts}:R>...**"
+DONE_THINKING_PREFIX = ""
 
 # Warning texts (templates)
 WARNING_MAX_TEXT_TEMPLATE = "⚠️ Max {max_text:,} characters per message"
