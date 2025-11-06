@@ -1,5 +1,7 @@
 services:
   container:
+    image: llmcordplus-container
+    container_name: llmcordplus
     build: .
     network_mode: host
     restart: unless-stopped

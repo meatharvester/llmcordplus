@@ -1,5 +1,5 @@
 [project]
-name = "llmcord"
+name = "llmcordplus"
 version = "0.1.0"
 description = "llmcord+ transforms Discord into a collaborative LLM frontend. It works with practically any LLM, remote or locally hosted."
 readme = "README.md"
